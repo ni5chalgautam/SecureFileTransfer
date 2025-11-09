@@ -1,178 +1,112 @@
-# modules/transfer.py
 import socket
-import threading
-import json
 import os
-import time
-from modules import hashing, compression
+from modules.compression import compress_file, decompress_file
+from modules.encryption import encrypt_file, decrypt_file
+from modules.hashing import hash_file
 
-DISCOVERY_PORT = 50000
-TRANSFER_PORT = 50010
-DISCOVERY_MSG = "MINISHARE_DISCOVER"
-CHUNK_SIZE = 8192
-DISCOVERY_TIMEOUT = 2.0  # increased for reliability
+BUFFER_SIZE = 4096
+
+class FileSender:
+    def __init__(self, key):
+        self.key = key
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+    def send_files(self, ip, files, progress_callback=None):
+        total_bytes = sum(os.path.getsize(f) for f in files)
+        sent_bytes = 0
+        for filepath in files:
+            if self.cancelled:
+                return False, "cancelled"
+
+            filename = os.path.basename(filepath)
+            # Compress & encrypt
+            temp_file = compress_file(filepath)
+            encrypted_file = encrypt_file(temp_file, self.key)
+
+            # Compute file hash
+            file_hash = hash_file(filepath)
+
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((ip, 5001))
+            s.send(f"{filename}:{os.path.getsize(encrypted_file)}".encode())
+            s.recv(1024)  # ACK
+
+            with open(encrypted_file, "rb") as f:
+                while chunk := f.read(BUFFER_SIZE):
+                    if self.cancelled:
+                        s.close()
+                        return False, "cancelled"
+                    s.sendall(chunk)
+                    sent_bytes += len(chunk)
+                    if progress_callback:
+                        progress_callback((sent_bytes / total_bytes) * 100)
+
+            # Send hash after file
+            s.send(f"HASH:{file_hash}".encode())
+            s.close()
+
+        return True, "success"
 
 
-# Helper function to receive exactly n bytes
-def recv_all(conn, n):
-    data = b""
-    while len(data) < n:
-        packet = conn.recv(n - len(data))
-        if not packet:
-            break
-        data += packet
-    return data
+class FileReceiver:
+    def __init__(self, key, save_folder):
+        self.key = key
+        self.save_folder = save_folder
+        self.cancelled = False
 
+    def cancel(self):
+        self.cancelled = True
 
-# ---------------- Peer Discovery ----------------
-def broadcast_discovery(timeout=DISCOVERY_TIMEOUT):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.settimeout(timeout)
+    def receive_files(self, progress_callback=None):
+        # For simplicity: handle files one by one
+        total_bytes = 0  # can calculate if sender sends total size
+        received_bytes = 0
 
-    try:
-        sock.sendto(DISCOVERY_MSG.encode(), ("<broadcast>", DISCOVERY_PORT))
-    except Exception:
-        pass
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("", 5001))
+        s.listen(1)
+        conn, addr = s.accept()
 
-    peers = []
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            data, addr = sock.recvfrom(2048)
-            info = json.loads(data.decode())
-            peers.append((addr[0], info.get("device", addr[0])))
-        except socket.timeout:
-            break
-        except Exception:
-            peers.append((addr[0], addr[0]))
-    sock.close()
-    return peers
-
-
-class DiscoveryListener(threading.Thread):
-    """Listens for UDP discovery requests and responds with device name."""
-
-    def __init__(self, device_name):
-        super().__init__(daemon=True)
-        self.device_name = device_name
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("", DISCOVERY_PORT))
-
-    def run(self):
         while True:
-            try:
-                data, addr = self.sock.recvfrom(2048)
-                if data.decode().startswith(DISCOVERY_MSG):
-                    resp = json.dumps({"device": self.device_name})
-                    self.sock.sendto(resp.encode(), addr)
-            except Exception:
-                pass
+            header = conn.recv(1024).decode()
+            if not header:
+                break
+            filename, filesize = header.split(":")
+            filesize = int(filesize)
+            conn.send(b"ACK")
 
-
-# ---------------- Peer Server ----------------
-class PeerServer(threading.Thread):
-    """Server that receives files from peers."""
-
-    def __init__(self, password, receive_dir="received", device_name="Peer"):
-        super().__init__(daemon=True)
-        self.password = password
-        self.receive_dir = receive_dir
-        self.device_name = device_name
-        os.makedirs(self.receive_dir, exist_ok=True)
-        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server.bind(("", TRANSFER_PORT))
-        self.server.listen(4)
-        self.running = True
-        DiscoveryListener(device_name).start()  # start discovery responder
-
-    def run(self):
-        while self.running:
-            try:
-                conn, addr = self.server.accept()
-                threading.Thread(
-                    target=self.handle_client, args=(conn,), daemon=True
-                ).start()
-            except Exception:
-                pass
-
-    def handle_client(self, conn):
-        try:
-            # Receive metadata length
-            meta_len_bytes = recv_all(conn, 4)
-            if len(meta_len_bytes) < 4:
-                conn.close()
-                return
-            meta_len = int.from_bytes(meta_len_bytes, "big")
-
-            # Receive encrypted metadata
-            meta_enc = recv_all(conn, meta_len)
-            meta = json.loads(
-                hashing.decrypt_bytes(meta_enc, self.password).decode()
-            )
-            filename = meta["filename"]
-            filesize = meta["size"]
-
-            # Receive encrypted file data
-            encrypted_data = recv_all(conn, filesize)
-
-            # Decrypt and decompress
-            decrypted = hashing.decrypt_bytes(encrypted_data, self.password)
-            decompressed = compression.decompress(decrypted)
-
-            # Save file
-            save_path = os.path.join(self.receive_dir, filename)
+            save_path = os.path.join(self.save_folder, filename + ".enc")
+            received = 0
             with open(save_path, "wb") as f:
-                f.write(decompressed)
+                while received < filesize:
+                    if self.cancelled:
+                        conn.close()
+                        return False, "cancelled"
+                    chunk = conn.recv(BUFFER_SIZE)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    received += len(chunk)
+                    if progress_callback:
+                        progress_callback((received_bytes + received) / filesize * 100)
+            received_bytes += received
 
-            # Acknowledge
-            conn.sendall(b"OK")
-            conn.close()
-            print(f"[+] Received file: {save_path}")
-        except Exception as e:
-            conn.close()
-            print(f"[-] Receive error: {e}")
+            # Receive hash
+            hash_msg = conn.recv(1024).decode()
+            if hash_msg.startswith("HASH:"):
+                received_hash = hash_msg.split(":")[1]
+                calc_hash = hash_file(save_path)
+                if received_hash == calc_hash:
+                    print(f"{filename} verified ✅")
+                else:
+                    print(f"{filename} corrupted ❌")
 
+            # Decrypt & decompress
+            decrypted_file = decrypt_file(save_path, self.key)
+            decompress_file(decrypted_file)
 
-# ---------------- Peer Client ----------------
-class PeerClient:
-    """Sends files to a given peer IP."""
-
-    def __init__(self, password):
-        self.password = password
-
-    def send_file(self, peer_ip, file_path):
-        try:
-            # Read, compress, encrypt
-            data = open(file_path, "rb").read()
-            compressed = compression.compress(data)
-            encrypted = hashing.encrypt_bytes(compressed, self.password)
-            filesize = len(encrypted)
-
-            # Prepare metadata
-            meta = json.dumps(
-                {"filename": os.path.basename(file_path), "size": filesize}
-            ).encode()
-            meta_enc = hashing.encrypt_bytes(meta, self.password)
-
-            # Connect & send
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((peer_ip, TRANSFER_PORT))
-            sock.sendall(len(meta_enc).to_bytes(4, "big"))
-            sock.sendall(meta_enc)
-
-            # Send file in chunks
-            offset = 0
-            while offset < len(encrypted):
-                sock.sendall(encrypted[offset : offset + CHUNK_SIZE])
-                offset += CHUNK_SIZE
-
-            # Wait for acknowledgement
-            resp = sock.recv(32)
-            sock.close()
-            return resp == b"OK"
-        except Exception as e:
-            print(f"[-] Send error: {e}")
-            return False
+        conn.close()
+        return True, "success"

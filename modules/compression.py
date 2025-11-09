@@ -1,27 +1,15 @@
-# modules/compression.py
-"""
-Simple RLE (Run-Length Encoding) compression/decompression.
-"""
+# compression.py
+import zipfile
+import os
 
-def compress(data: bytes) -> bytes:
-    out = bytearray()
-    i = 0
-    while i < len(data):
-        count = 1
-        while i + 1 < len(data) and data[i] == data[i+1] and count < 255:
-            count += 1
-            i += 1
-        out.append(count)
-        out.append(data[i])
-        i += 1
-    return bytes(out)
+def compress_file(file_path):
+    zip_path = f"{file_path}.zip"
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.write(file_path, os.path.basename(file_path))
+    return zip_path
 
-def decompress(data: bytes) -> bytes:
-    out = bytearray()
-    i = 0
-    while i < len(data):
-        count = data[i]
-        i += 1
-        out.extend([data[i]] * count)
-        i += 1
-    return bytes(out)
+def decompress_file(zip_path, extract_folder):
+    import zipfile
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        zf.extractall(extract_folder)
+    return os.path.join(extract_folder, os.path.basename(zip_path).replace('.zip', ''))
